@@ -22,6 +22,8 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import json
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -43,6 +45,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+
+    best_test_l1 = 1e9
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -101,7 +105,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            test_metrics = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -127,6 +132,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            
+            test_l1 = test_metrics['l1']
+            test_psnr = test_metrics['psnr']
+
+            if test_l1 is not None and test_l1 < best_test_l1:
+                best_test_l1 = test_l1
+                print("\n[ITER {}] Saving Best".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/best.pth")
+
+                # saving the results to a json file 
+                best_json = os.path.join(scene.model_path, 'best.json')
+                with open(best_json, 'w') as f:
+                    test_metrics['step'] = iteration
+                    json.dump(test_metrics, f)
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -156,6 +176,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
+    test_l1 = None 
+    test_psnr = None
+
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
@@ -178,6 +201,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+
+                # TODO, we add the early stop here.
+                if config['name'] == 'test':
+                    test_l1 = l1_test.item()
+                    test_psnr = psnr_test.item()
+
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
@@ -186,6 +215,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+
+    return {'l1': test_l1, 'psnr': test_psnr} 
+
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -197,7 +229,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 8_000, 40_000, 50_000, 60_000, 80_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -205,6 +237,11 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
+    # change the test iterations to uniformly in the 30K
+    train_range = args.iterations // 1000
+    args.test_iterations = [i * 1000 for i in range(1, train_range)]
+    args.save_iterations = [i * 3000 for i in range(1, train_range//3)]
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
